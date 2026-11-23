@@ -5,6 +5,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 final FlutterLocalNotificationsPlugin notificationsPlugin =
     FlutterLocalNotificationsPlugin();
@@ -13,6 +14,8 @@ const int ongoingPrayerNotificationId = 1001;
 const String ongoingChannelId = 'next_prayer_ongoing_channel';
 const String ongoingChannelName = 'الصلاة القادمة المثبتة';
 const String prefPinNotificationKey = 'pin_next_prayer_notification';
+const String versionJsonUrl =
+    'https://raw.githubusercontent.com/ibrahimatefhussier/prayer-times-app/main/version.json';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -84,6 +87,8 @@ class PrayerHomeScreen extends StatefulWidget {
 
 class _PrayerHomeScreenState extends State<PrayerHomeScreen>
     with WidgetsBindingObserver {
+  static const int currentVersionCode = 1;
+
   final List<CityOption> cities = const [
     CityOption(label: 'القاهرة، مصر', city: 'Cairo', country: 'Egypt', method: 5),
     CityOption(label: 'الإسكندرية، مصر', city: 'Alexandria', country: 'Egypt', method: 5),
@@ -100,6 +105,11 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   String locationTitle = 'جاري تحديد موقعك...';
   bool isUsingGps = true;
   bool isNotificationPinned = true;
+
+  bool isUpdateRequired = false;
+  String updateVersionName = '';
+  String updateApkUrl = '';
+  String updateNotes = '';
 
   Map<String, String>? timings;
   String hijriDate = '';
@@ -135,7 +145,7 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _loadPinPreferenceAndStart();
+    _initializeApp();
   }
 
   @override
@@ -147,17 +157,60 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && isNotificationPinned) {
-      _syncOngoingNotification(force: true);
+    if (state == AppLifecycleState.resumed) {
+      _checkForMandatoryUpdate().then((blocked) {
+        if (!blocked && isNotificationPinned) {
+          _syncOngoingNotification(force: true);
+        }
+      });
     }
+  }
+
+  Future<void> _initializeApp() async {
+    await _loadPinPreferenceAndStart();
+    await _checkForMandatoryUpdate();
+  }
+
+  Future<bool> _checkForMandatoryUpdate() async {
+    try {
+      final uri = Uri.parse(
+        '$versionJsonUrl?t=${DateTime.now().millisecondsSinceEpoch}',
+      );
+      final response = await http.get(uri).timeout(const Duration(seconds: 6));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final remoteCode =
+            int.tryParse(data['latest_version_code'].toString()) ?? currentVersionCode;
+        final forceUpdate = data['force_update'] == true;
+
+        if (remoteCode > currentVersionCode && forceUpdate) {
+          timer?.cancel();
+          if (mounted) {
+            setState(() {
+              isUpdateRequired = true;
+              isLoading = false;
+              updateVersionName = (data['latest_version_name'] ?? '').toString();
+              updateApkUrl = (data['apk_url'] ?? '').toString();
+              updateNotes = (data['notes'] ?? 'يتوفر تحديث جديد، يرجى التحديث للمتابعة.')
+                  .toString();
+            });
+          }
+          return true;
+        }
+      }
+    } catch (_) {
+      // لا يوجد إنترنت: نكمل تشغيل التطبيق بشكل طبيعي دون إجبار على النت
+    }
+    return false;
   }
 
   Future<void> _loadPinPreferenceAndStart() async {
     final prefs = await SharedPreferences.getInstance();
-    // الافتراضي true: يثبت تلقائياً بمجرد فتح التطبيق ولا يُزال إلا من داخل التطبيق
     final savedPin = prefs.getBool(prefPinNotificationKey) ?? true;
     await prefs.setBool(prefPinNotificationKey, savedPin);
 
+    if (!mounted) return;
     setState(() {
       isNotificationPinned = savedPin;
     });
@@ -173,6 +226,7 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(prefPinNotificationKey, value);
 
+    if (!mounted) return;
     setState(() {
       isNotificationPinned = value;
       _lastNotifiedMinuteKey = -1;
@@ -196,7 +250,10 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   }
 
   Future<void> _syncOngoingNotification({bool force = false}) async {
-    if (!isNotificationPinned || timings == null || nextPrayerName == '--') {
+    if (isUpdateRequired ||
+        !isNotificationPinned ||
+        timings == null ||
+        nextPrayerName == '--') {
       return;
     }
 
@@ -212,7 +269,8 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
     }
     _lastNotifiedMinuteKey = minuteBucket;
 
-    final prayerTime24 = activePrayerKey != null ? (timings![activePrayerKey] ?? '') : '';
+    final prayerTime24 =
+        activePrayerKey != null ? (timings![activePrayerKey] ?? '') : '';
     final formattedTime = prayerTime24.isNotEmpty ? format12Hour(prayerTime24) : '';
 
     const androidDetails = AndroidNotificationDetails(
@@ -240,6 +298,8 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   }
 
   Future<void> fetchByGps() async {
+    if (isUpdateRequired) return;
+
     setState(() {
       isLoading = true;
       errorMessage = null;
@@ -279,6 +339,7 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
       if (response.statusCode == 200) {
         final decoded = jsonDecode(response.body) as Map<String, dynamic>;
         if (decoded['code'] == 200) {
+          if (!mounted) return;
           setState(() {
             selectedCity = null;
             locationTitle =
@@ -296,6 +357,7 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   }
 
   void _fallbackToDefaultCity(String notice) {
+    if (!mounted) return;
     final fallback = cities.first;
     setState(() {
       selectedCity = fallback;
@@ -306,6 +368,8 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   }
 
   Future<void> fetchByCity(CityOption cityOption, {String? notice}) async {
+    if (isUpdateRequired) return;
+
     setState(() {
       isLoading = true;
       errorMessage = null;
@@ -333,11 +397,13 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
         }
       }
 
+      if (!mounted) return;
       setState(() {
         isLoading = false;
         errorMessage = 'تعذر جلب مواقيت الصلاة حالياً';
       });
     } catch (_) {
+      if (!mounted) return;
       setState(() {
         isLoading = false;
         errorMessage = 'تأكد من اتصالك بالإنترنت ثم أعد المحاولة';
@@ -346,6 +412,7 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   }
 
   void _applyTimingsData(Map<String, dynamic> data) {
+    if (!mounted) return;
     final rawTimings = data['timings'] as Map<String, dynamic>;
     final hijri = data['date']['hijri'] as Map<String, dynamic>;
     final gregorian = data['date']['gregorian'] as Map<String, dynamic>;
@@ -382,7 +449,7 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
   void startCountdown() {
     timer?.cancel();
     void updateTick() {
-      if (timings == null || !mounted) return;
+      if (isUpdateRequired || timings == null || !mounted) return;
       final now = DateTime.now();
 
       String? foundKey;
@@ -435,6 +502,92 @@ class _PrayerHomeScreenState extends State<PrayerHomeScreen>
 
   @override
   Widget build(BuildContext context) {
+    if (isUpdateRequired) {
+      return PopScope(
+        canPop: false,
+        child: Scaffold(
+          backgroundColor: const Color(0xFFF4F7F5),
+          body: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.08),
+                      blurRadius: 12,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.system_update,
+                      size: 64,
+                      color: Color(0xFF0F5132),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      updateVersionName.isNotEmpty
+                          ? 'تحديث إجباري متاح ($updateVersionName)'
+                          : 'تحديث إجباري متاح',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF1E293B),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      updateNotes,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        color: Color(0xFF64748B),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: () async {
+                          if (updateApkUrl.isNotEmpty) {
+                            final url = Uri.parse(updateApkUrl);
+                            if (await canLaunchUrl(url)) {
+                              await launchUrl(url, mode: LaunchMode.externalApplication);
+                            }
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF0F5132),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        icon: const Icon(Icons.download),
+                        label: const Text(
+                          'تحديث التطبيق الآن',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     const primaryGreen = Color(0xFF0F5132);
     const goldColor = Color(0xFFD4AF37);
 
